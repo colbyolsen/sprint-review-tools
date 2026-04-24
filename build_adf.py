@@ -295,15 +295,38 @@ def build_document(data):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: build_adf.py <data.json> <out_adf.json>", file=sys.stderr)
+    # Two invocation modes:
+    #   build_adf.py <data.json> <out.json>
+    #     - Single combined input file.
+    #   build_adf.py --parts <meta.json> <current.json> <next.json> <out.json>
+    #     - Split inputs. meta.json holds everything except the two ticket arrays;
+    #       current.json and next.json each hold a bare array of ticket dicts.
+    argv = sys.argv[1:]
+    if len(argv) == 2:
+        data = json.loads(open(argv[0]).read())
+        out_path = argv[1]
+    elif len(argv) == 5 and argv[0] == "--parts":
+        meta = json.loads(open(argv[1]).read())
+        current = json.loads(open(argv[2]).read())
+        nxt = json.loads(open(argv[3]).read())
+        data = dict(meta)
+        data["current_sprint_tickets"] = current
+        data["next_sprint_tickets"] = nxt
+        out_path = argv[4]
+    else:
+        print(
+            "usage:\n"
+            "  build_adf.py <data.json> <out.json>\n"
+            "  build_adf.py --parts <meta.json> <current.json> <next.json> <out.json>",
+            file=sys.stderr,
+        )
         sys.exit(2)
-    data = json.loads(open(sys.argv[1]).read())
+
     doc = build_document(data)
-    with open(sys.argv[2], "w") as f:
+    with open(out_path, "w") as f:
         f.write(json.dumps(doc))
     print(
-        f"Wrote {sys.argv[2]}: {len(doc['content'])} nodes, "
+        f"Wrote {out_path}: {len(doc['content'])} nodes, "
         f"{len(data['current_sprint_tickets'])} cur, "
         f"{len(data['next_sprint_tickets'])} nxt"
     )
