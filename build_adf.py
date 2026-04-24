@@ -75,26 +75,33 @@ def H(level, s, bold=False):
     }
 
 
-def TH(s):
-    return {"type": "tableHeader", "content": [P([T(s, [{"type": "strong"}])])]}
+def TH(s, colwidth=None):
+    attrs = {"colspan": 1, "rowspan": 1}
+    if colwidth is not None:
+        attrs["colwidth"] = [colwidth]
+    return {"type": "tableHeader", "attrs": attrs, "content": [P([T(s, [{"type": "strong"}])])]}
 
 
-def TC(c, bg=None):
-    r = {"type": "tableCell"}
+def TC(c, bg=None, colwidth=None):
+    attrs = {"colspan": 1, "rowspan": 1}
     if bg:
-        r["attrs"] = {"background": bg}
-    r["content"] = c
-    return r
+        attrs["background"] = bg
+    if colwidth is not None:
+        attrs["colwidth"] = [colwidth]
+    return {"type": "tableCell", "attrs": attrs, "content": c}
 
 
 def row(cells):
     return {"type": "tableRow", "content": cells}
 
 
-def tbl(rows):
+def tbl(rows, width=None):
+    attrs = {"isNumberColumnEnabled": False, "layout": "default"}
+    if width is not None:
+        attrs["width"] = width
     return {
         "type": "table",
-        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+        "attrs": attrs,
         "content": rows,
     }
 
@@ -161,6 +168,11 @@ def ticket_link(key, jira_base_url):
     )
 
 
+CURRENT_COL_WIDTHS = [231, 119, 149, 536, 119, 125, 139, 150]
+NEXT_COL_WIDTHS = [360, 150, 779, 149, 360]
+TABLE_WIDTH = 1800
+
+
 def current_row(t, cfg):
     done_text = "DONE" if t["status_name"] == "Complete" else "NOT DONE"
     done_color = "green" if t["status_name"] == "Complete" else "red"
@@ -168,16 +180,17 @@ def current_row(t, cfg):
     rtc = cfg["released_to_prod_colors"].get(t["released_to_prod"], "neutral")
     speaker = t.get("speaker", "")
     team_bg = cfg["team_backgrounds"].get(t["team"])
+    w = CURRENT_COL_WIDTHS
     return row(
         [
-            TC([P([T(t["goal_text"], [{"type": "strong"}])])]),
-            TC([P([T(t["team"])])], bg=team_bg),
-            TC([P([T(speaker)]) if speaker else P()]),
-            TC([P([T(t["outcome"], [{"type": "em"}])])]),
-            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])]),
-            TC([P([stat(done_text, done_color)]), P([stat(t["status_name"], jc)])]),
-            TC([P()]),
-            TC([P([stat(t["released_to_prod"], rtc)])]),
+            TC([P([T(t["goal_text"], [{"type": "strong"}])])], colwidth=w[0]),
+            TC([P([T(t["team"])])], bg=team_bg, colwidth=w[1]),
+            TC([P([T(speaker)]) if speaker else P()], colwidth=w[2]),
+            TC([P([T(t["outcome"], [{"type": "em"}])])], colwidth=w[3]),
+            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])], colwidth=w[4]),
+            TC([P([stat(done_text, done_color)]), P([stat(t["status_name"], jc)])], colwidth=w[5]),
+            TC([P()], colwidth=w[6]),
+            TC([P([stat(t["released_to_prod"], rtc)])], colwidth=w[7]),
         ]
     )
 
@@ -188,13 +201,14 @@ def next_row(t, cfg):
         outcome_content = t["outcome_nodes"]
     else:
         outcome_content = [P([T(t["outcome"], [{"type": "em"}])])]
+    w = NEXT_COL_WIDTHS
     return row(
         [
-            TC([P([T(t["goal_text"], [{"type": "strong"}])])]),
-            TC([P([T(t["team"])])], bg=team_bg),
-            TC(outcome_content),
-            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])]),
-            TC([P()]),
+            TC([P([T(t["goal_text"], [{"type": "strong"}])])], colwidth=w[0]),
+            TC([P([T(t["team"])])], bg=team_bg, colwidth=w[1]),
+            TC(outcome_content, colwidth=w[2]),
+            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])], colwidth=w[3]),
+            TC([P()], colwidth=w[4]),
         ]
     )
 
@@ -249,13 +263,29 @@ def build_document(data):
     for panel in data.get("intro_panels", []):
         content.append(rich_panel(panel))
 
+    def current_header_row():
+        return row(
+            [TH(h, colwidth=CURRENT_COL_WIDTHS[i]) for i, h in enumerate(CURRENT_HEADERS)]
+        )
+
+    def next_header_row():
+        return row(
+            [TH(h, colwidth=NEXT_COL_WIDTHS[i]) for i, h in enumerate(NEXT_HEADERS)]
+        )
+
     content.append(heading_only_panel(cfg["spotlight_heading"]))
     content.append(
         tbl(
             [
-                row([TH(h) for h in CURRENT_HEADERS]),
-                row([TC([P()]) for _ in range(len(CURRENT_HEADERS))]),
-            ]
+                current_header_row(),
+                row(
+                    [
+                        TC([P()], colwidth=CURRENT_COL_WIDTHS[i])
+                        for i in range(len(CURRENT_HEADERS))
+                    ]
+                ),
+            ],
+            width=TABLE_WIDTH,
         )
     )
 
@@ -266,8 +296,8 @@ def build_document(data):
         content.append(heading_only_panel(cat))
         content.append(
             tbl(
-                [row([TH(h) for h in CURRENT_HEADERS])]
-                + [current_row(t, cfg) for t in cur_g[cat]]
+                [current_header_row()] + [current_row(t, cfg) for t in cur_g[cat]],
+                width=TABLE_WIDTH,
             )
         )
         content.append(stubs_block())
@@ -281,8 +311,8 @@ def build_document(data):
         content.append(heading_only_panel(cat))
         content.append(
             tbl(
-                [row([TH(h) for h in NEXT_HEADERS])]
-                + [next_row(t, cfg) for t in nxt_g[cat]]
+                [next_header_row()] + [next_row(t, cfg) for t in nxt_g[cat]],
+                width=TABLE_WIDTH,
             )
         )
 
