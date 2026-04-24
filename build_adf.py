@@ -1,19 +1,56 @@
 #!/usr/bin/env python3
-"""Sprint Review ADF generator.
+"""Generic sprint review ADF generator.
 
-Consumes a compact JSON describing current/next-sprint tickets and emits a
-full Atlassian Document Format document matching the Conservice Billing + Automations
-sprint review template.
+Consumes a JSON data file describing per-sprint content and emits an Atlassian
+Document Format (ADF) document. All domain-specific text (category names,
+panel content, URL patterns, color maps) is carried in the data file so this
+generator can be reused across teams.
 
-Usage: python3 build_adf.py <sprint_data.json> <out_adf.json>
+Usage:
+    python3 build_adf.py <data.json> <out_adf.json>
+
+Data JSON schema (top-level keys):
+    ending_sprint              str  e.g. "26.08"
+    next_sprint                str  e.g. "26.09"
+    review_date                str  free-form, displayed bold under H1
+    config                     obj  rendering config (see below)
+    intro_panels               list rich info panels rendered before current-sprint section
+    outro_panels               list rich info panels rendered after next-sprint section
+    current_sprint_tickets     list ticket rows for current-sprint tables
+    next_sprint_tickets        list ticket rows for next-sprint tables
+
+config object:
+    jira_base_url                       str
+    team_backgrounds                    map team -> hex color
+    status_colors                       map jira status -> adf status color
+    released_to_prod_colors             map "YES"|"NO"|"N/A" -> adf status color
+    current_sprint_h2                   str
+    next_sprint_h2_fmt                  str with a single {} placeholder for the next sprint name
+    spotlight_heading                   str (panel heading before the spotlight table)
+    current_sprint_category_order       list of category names in render order
+    next_sprint_category_order          list of category names in render order
+
+rich panel body node types (used in intro_panels/outro_panels body arrays):
+    {"type": "paragraph", "text": "...", "bold": true|false}
+    {"type": "bullet",    "text": "...", "sub": ["..."]}   # sub items optional
+
+current-sprint ticket schema:
+    {"key":"...", "team":"...", "speaker":"...", "category":"...",
+     "goal_text":"...", "outcome":"...",
+     "status_name":"...", "released_to_prod":"YES"|"NO"|"N/A"}
+
+next-sprint ticket schema:
+    {"key":"...", "team":"...", "category":"...",
+     "goal_text":"...", "outcome":"..."}
+   or if the outcome is multi-rule / structured:
+    {"key":"...", "team":"...", "category":"...",
+     "goal_text":"...", "outcome_nodes":[<adf nodes>]}
 """
 import json
 import sys
 
-d = json.loads(open(sys.argv[1]).read())
-es, ns, rd = d["ending_sprint"], d["next_sprint"], d["review_date"]
-cur, nxt = d["current_sprint_tickets"], d["next_sprint_tickets"]
 
+# ---------- ADF node helpers ----------
 
 def T(s, m=None):
     n = {"type": "text", "text": s}
@@ -29,11 +66,12 @@ def P(c=None):
     return p
 
 
-def H(l, s, bold=False):
+def H(level, s, bold=False):
+    marks = [{"type": "strong"}] if bold else None
     return {
         "type": "heading",
-        "attrs": {"level": l},
-        "content": [T(s, [{"type": "strong"}]) if bold else T(s)],
+        "attrs": {"level": level},
+        "content": [T(s, marks)],
     }
 
 
@@ -62,108 +100,106 @@ def tbl(rows):
 
 
 def stat(txt, color):
-    return {
-        "type": "status",
-        "attrs": {"text": txt, "color": color, "style": "bold"},
-    }
+    return {"type": "status", "attrs": {"text": txt, "color": color, "style": "bold"}}
 
 
-def pan(title):
-    return {
-        "type": "panel",
-        "attrs": {"panelType": "info"},
-        "content": [H(3, title, bold=True)],
-    }
+def info_panel(content):
+    return {"type": "panel", "attrs": {"panelType": "info"}, "content": content}
 
 
-def bl(items):
+def heading_only_panel(title):
+    return info_panel([H(3, title, bold=True)])
+
+
+def bullet_list(items):
     return {"type": "bulletList", "content": items}
 
 
-def li(para_c, nested=None):
-    out = [P(para_c) if para_c else P()]
+def list_item(paragraph_content, nested=None):
+    out = [P(paragraph_content) if paragraph_content else P()]
     if nested:
         out.append(nested)
     return {"type": "listItem", "content": out}
 
 
-def link_text(key):
+# ---------- rich panel body expansion ----------
+
+def expand_body_nodes(body):
+    """Expand a list of rich-panel body descriptors into ADF nodes."""
+    out = []
+    for item in body:
+        kind = item["type"]
+        if kind == "paragraph":
+            marks = [{"type": "strong"}] if item.get("bold") else None
+            out.append(P([T(item["text"], marks)]))
+        elif kind == "bullet":
+            sub = item.get("sub") or []
+            nested = (
+                bullet_list([list_item([T(s)]) for s in sub]) if sub else None
+            )
+            out.append(bullet_list([list_item([T(item["text"])], nested)]))
+        else:
+            raise ValueError(f"unknown body node type: {kind}")
+    return out
+
+
+def rich_panel(panel):
+    content = [H(3, panel["heading"], bold=True)]
+    content.extend(expand_body_nodes(panel.get("body", [])))
+    return info_panel(content)
+
+
+# ---------- ticket row renderers ----------
+
+def ticket_link(key, jira_base_url):
     return T(
         key,
         [
-            {
-                "type": "link",
-                "attrs": {"href": f"https://conservice.atlassian.net/browse/{key}"},
-            },
+            {"type": "link", "attrs": {"href": f"{jira_base_url}{key}"}},
             {"type": "em"},
         ],
     )
 
 
-TEAM_BG = {"Billing 1": "#DEEBFF", "Automations": "#E3FCEF"}
-JSC = {
-    "Complete": "green",
-    "Testing": "yellow",
-    "Code Review & Security": "blue",
-    "Development": "purple",
-    "Design": "purple",
-    "Backlog": "neutral",
-}
-RTC = {"YES": "green", "NO": "red", "N/A": "neutral"}
-
-
-def cur_row(t):
+def current_row(t, cfg):
     done_text = "DONE" if t["status_name"] == "Complete" else "NOT DONE"
     done_color = "green" if t["status_name"] == "Complete" else "red"
-    jc = JSC.get(t["status_name"], "neutral")
-    sp = t.get("speaker", "")
+    jc = cfg["status_colors"].get(t["status_name"], "neutral")
+    rtc = cfg["released_to_prod_colors"].get(t["released_to_prod"], "neutral")
+    speaker = t.get("speaker", "")
+    team_bg = cfg["team_backgrounds"].get(t["team"])
     return row(
         [
             TC([P([T(t["goal_text"], [{"type": "strong"}])])]),
-            TC([P([T(t["team"])])], bg=TEAM_BG[t["team"]]),
-            TC([P([T(sp)]) if sp else P()]),
+            TC([P([T(t["team"])])], bg=team_bg),
+            TC([P([T(speaker)]) if speaker else P()]),
             TC([P([T(t["outcome"], [{"type": "em"}])])]),
-            TC([P([link_text(t["key"])])]),
-            TC(
-                [
-                    P([stat(done_text, done_color)]),
-                    P([stat(t["status_name"], jc)]),
-                ]
-            ),
+            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])]),
+            TC([P([stat(done_text, done_color)]), P([stat(t["status_name"], jc)])]),
             TC([P()]),
-            TC(
-                [
-                    P(
-                        [
-                            stat(
-                                t["released_to_prod"],
-                                RTC.get(t["released_to_prod"], "neutral"),
-                            )
-                        ]
-                    )
-                ]
-            ),
+            TC([P([stat(t["released_to_prod"], rtc)])]),
         ]
     )
 
 
-def nxt_row(t):
+def next_row(t, cfg):
+    team_bg = cfg["team_backgrounds"].get(t["team"])
     if isinstance(t.get("outcome_nodes"), list):
-        oc = t["outcome_nodes"]
+        outcome_content = t["outcome_nodes"]
     else:
-        oc = [P([T(t["outcome"], [{"type": "em"}])])]
+        outcome_content = [P([T(t["outcome"], [{"type": "em"}])])]
     return row(
         [
             TC([P([T(t["goal_text"], [{"type": "strong"}])])]),
-            TC([P([T(t["team"])])], bg=TEAM_BG[t["team"]]),
-            TC(oc),
-            TC([P([link_text(t["key"])])]),
+            TC([P([T(t["team"])])], bg=team_bg),
+            TC(outcome_content),
+            TC([P([ticket_link(t["key"], cfg["jira_base_url"])])]),
             TC([P()]),
         ]
     )
 
 
-CUR_HDR = [
+CURRENT_HEADERS = [
     "Goal",
     "Team",
     "Speaker",
@@ -173,146 +209,105 @@ CUR_HDR = [
     "Target Release",
     "Released to Prod",
 ]
-NXT_HDR = ["Goal", "Team", "Outcome", "Ticket #", "Feedback"]
-
-CUR_ORDER = [
-    "Long Tail",
-    "Subs on Skywalker",
-    "NAS on Skywalker",
-    "QC Task Optimization",
-    "Online Prebill",
-    "Incremental and Legacy Enhancements",
-    "Tech Debt",
-    "Move Outs",
-    "Single Family Bill Estimator",
-]
-NXT_ORDER = [
-    "Long Tail",
-    "Subs on Skywalker",
-    "NAS on Skywalker",
-    "QC Task Optimization",
-    "Online Prebill",
-    "Incremental Enhancements",
-    "Tech Debt",
-    "Move Outs",
-    "Single Family Bill Estimator",
-]
+NEXT_HEADERS = ["Goal", "Team", "Outcome", "Ticket #", "Feedback"]
 
 
-def group(tickets):
+def stubs_block():
+    return bullet_list(
+        [
+            list_item([T("Demo:")], bullet_list([list_item([])])),
+            list_item([T("Feedback:")], bullet_list([list_item([])])),
+        ]
+    )
+
+
+def group_by_category(tickets):
     g = {}
     for t in tickets:
         g.setdefault(t["category"], []).append(t)
     return g
 
 
-cur_g, nxt_g = group(cur), group(nxt)
+# ---------- document assembly ----------
 
-CORE_DATA = {
-    "type": "panel",
-    "attrs": {"panelType": "info"},
-    "content": [
-        H(3, "Core Data Adoption", bold=True),
-        P([T('How will we, as a domain, use "Core Data"?', [{"type": "strong"}])]),
-        bl(
-            [
-                li(
-                    [
-                        T(
-                            "Although we see some areas where we may be able to introduce Core Data to ourselves, the primary uses which are documented so far seem to be Synergy based."
-                        )
-                    ],
-                    bl(
-                        [
-                            li(
-                                [
-                                    T(
-                                        "We need to see more documentation and have more discussions."
-                                    )
-                                ]
-                            )
-                        ]
-                    ),
-                )
-            ]
-        ),
-        P(
-            [
-                T(
-                    'What is our current status of using "Core Data"?',
-                    [{"type": "strong"}],
-                )
-            ]
-        ),
-        bl(
-            [
-                li(
-                    [
-                        T(
-                            "Billing is dependent on the creation of unit, building groups, and building objects in core data, which is dependent on Onboarding Transformation. The timeline and prioritization of that transformation is TBD."
-                        )
-                    ]
-                )
-            ]
-        ),
-    ],
-}
+def build_document(data):
+    cfg = data["config"]
+    es = data["ending_sprint"]
+    ns = data["next_sprint"]
+    rd = data["review_date"]
+    cur = data["current_sprint_tickets"]
+    nxt = data["next_sprint_tickets"]
 
-SEVERITY = {
-    "type": "panel",
-    "attrs": {"panelType": "info"},
-    "content": [H(3, "Severity Incidents", bold=True), bl([li([T("None")])])],
-}
+    cur_g = group_by_category(cur)
+    nxt_g = group_by_category(nxt)
 
+    content = [
+        H(1, f"Sprint {es}"),
+        P([T(rd, [{"type": "strong"}])]),
+    ]
 
-def stubs():
-    return bl(
-        [
-            li([T("Demo:")], bl([li([])])),
-            li([T("Feedback:")], bl([li([])])),
-        ]
-    )
+    for panel in data.get("intro_panels", []):
+        content.append(rich_panel(panel))
 
-
-content = [
-    H(1, f"Sprint {es}"),
-    P([T(rd, [{"type": "strong"}])]),
-    CORE_DATA,
-    pan("Spotlight Demo"),
-    tbl(
-        [
-            row([TH(h) for h in CUR_HDR]),
-            row([TC([P()]) for _ in range(8)]),
-        ]
-    ),
-    H(2, "Current Sprint Goals (45 min)"),
-]
-
-for cat in CUR_ORDER:
-    if cat not in cur_g:
-        continue
-    content.append(pan(cat))
+    content.append(heading_only_panel(cfg["spotlight_heading"]))
     content.append(
-        tbl([row([TH(h) for h in CUR_HDR])] + [cur_row(t) for t in cur_g[cat]])
-    )
-    content.append(stubs())
-
-content.append({"type": "rule"})
-content.append(H(2, f"Looking Ahead to Next Sprint - {ns} (10 min)"))
-
-for cat in NXT_ORDER:
-    if cat not in nxt_g:
-        continue
-    content.append(pan(cat))
-    content.append(
-        tbl([row([TH(h) for h in NXT_HDR])] + [nxt_row(t) for t in nxt_g[cat]])
+        tbl(
+            [
+                row([TH(h) for h in CURRENT_HEADERS]),
+                row([TC([P()]) for _ in range(len(CURRENT_HEADERS))]),
+            ]
+        )
     )
 
-content.append({"type": "rule"})
-content.append(SEVERITY)
+    content.append(H(2, cfg["current_sprint_h2"]))
+    for cat in cfg["current_sprint_category_order"]:
+        if cat not in cur_g:
+            continue
+        content.append(heading_only_panel(cat))
+        content.append(
+            tbl(
+                [row([TH(h) for h in CURRENT_HEADERS])]
+                + [current_row(t, cfg) for t in cur_g[cat]]
+            )
+        )
+        content.append(stubs_block())
 
-doc = {"type": "doc", "version": 1, "content": content}
-open(sys.argv[2], "w").write(json.dumps(doc))
-print(
-    f"Wrote {sys.argv[2]}, {len(content)} nodes, {len(cur)} cur tickets, {len(nxt)} nxt tickets"
-)
+    content.append({"type": "rule"})
+    content.append(H(2, cfg["next_sprint_h2_fmt"].format(ns)))
+
+    for cat in cfg["next_sprint_category_order"]:
+        if cat not in nxt_g:
+            continue
+        content.append(heading_only_panel(cat))
+        content.append(
+            tbl(
+                [row([TH(h) for h in NEXT_HEADERS])]
+                + [next_row(t, cfg) for t in nxt_g[cat]]
+            )
+        )
+
+    if data.get("outro_panels"):
+        content.append({"type": "rule"})
+        for panel in data["outro_panels"]:
+            content.append(rich_panel(panel))
+
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: build_adf.py <data.json> <out_adf.json>", file=sys.stderr)
+        sys.exit(2)
+    data = json.loads(open(sys.argv[1]).read())
+    doc = build_document(data)
+    with open(sys.argv[2], "w") as f:
+        f.write(json.dumps(doc))
+    print(
+        f"Wrote {sys.argv[2]}: {len(doc['content'])} nodes, "
+        f"{len(data['current_sprint_tickets'])} cur, "
+        f"{len(data['next_sprint_tickets'])} nxt"
+    )
+
+
+if __name__ == "__main__":
+    main()
