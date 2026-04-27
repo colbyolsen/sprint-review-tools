@@ -168,7 +168,7 @@ def ticket_link(key, jira_base_url):
     )
 
 
-CURRENT_COL_WIDTHS = [231, 119, 149, 536, 119, 125, 139, 150]
+CURRENT_COL_WIDTHS = [231, 150, 149, 505, 119, 125, 139, 150]
 NEXT_COL_WIDTHS = [360, 150, 779, 149, 360]
 TABLE_WIDTH = 1800
 
